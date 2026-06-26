@@ -9,6 +9,11 @@ import gleamgen/internal/render
 import gleamgen/type_
 import gleamgen/type_/custom
 
+pub type RestPattern(output) {
+  RestVariable(name: String, output: output)
+  RestDiscard
+}
+
 pub opaque type Pattern(input, match_output) {
   Variable(name: String, output: match_output)
   StringLiteral(contents: String, output: match_output)
@@ -31,6 +36,11 @@ pub opaque type Pattern(input, match_output) {
   As(
     options: #(Pattern(type_.Dynamic, type_.Dynamic), String),
     output: match_output,
+  )
+  List(
+    elements: List(Pattern(type_.Dynamic, type_.Dynamic)),
+    output: match_output,
+    rest: Option(RestPattern(match_output)),
   )
 }
 
@@ -188,7 +198,7 @@ pub fn from_constructor0(
 ///     variant.new("Dog")
 ///     |> variant.with_argument(option.Some("bones"), type_.int)
 ///   })
-/// 
+///
 /// use animal_type, dog_constructor <- module.with_custom_type1(
 ///   definition.new("Animal") |> definition.with_publicity(True),
 ///   animals,
@@ -753,8 +763,6 @@ pub fn tuple9(
   )
 }
 
-// }}}
-
 pub fn get_output(pattern: Pattern(_, output)) -> output {
   pattern.output
 }
@@ -764,6 +772,10 @@ pub fn get_output(pattern: Pattern(_, output)) -> output {
 pub fn to_dynamic(
   type_: Pattern(input, handler_output),
 ) -> Pattern(type_.Dynamic, type_.Dynamic)
+
+@external(erlang, "gleamgen_ffi", "identity")
+@external(javascript, "../gleamgen_ffi.mjs", "identity")
+fn to_output(expr: Expression(a)) -> output
 
 pub fn render(
   pattern: Pattern(_, _),
@@ -882,6 +894,38 @@ pub fn render(
       }
       |> render.Render(details:)
     }
+    List(elements:, rest:, ..) -> {
+      let #(details, element_docs) =
+        elements
+        |> list.map_fold(render.empty_details, fn(acc, m) {
+          let rendered = render(m, context, 1)
+          #(render.merge_details(acc, rendered.details), rendered.doc)
+        })
+
+      case elements {
+        [] ->
+          case rest {
+            option.None -> doc.from_string("[]")
+            option.Some(RestDiscard) -> doc.from_string("_")
+            option.Some(RestVariable(name:, ..)) -> doc.from_string(name)
+          }
+        _ -> {
+          let elements_with_rest = case rest {
+            option.None -> element_docs
+            option.Some(RestDiscard) ->
+              list.append(element_docs, [doc.from_string("..")])
+            option.Some(RestVariable(name, ..)) ->
+              list.append(element_docs, [doc.from_string(".." <> name)])
+          }
+
+          elements_with_rest
+          |> doc.join(with: doc.from_string(", "))
+          |> doc.prepend(doc.from_string("["))
+          |> doc.append(doc.from_string("]"))
+        }
+      }
+      |> render.Render(details:)
+    }
   }
 }
 
@@ -897,21 +941,81 @@ pub fn can_match_on_multiple(pattern: Pattern(_, _)) -> Bool {
 
 /// Renders `[]`.
 pub fn list_empty() -> Pattern(List(a), Nil) {
-  Constructor(module: option.None, constructor: #("[]", []), output: Nil)
+  List(elements: [], output: Nil, rest: option.None)
 }
 
 /// Renders `[first, ..]` and binds the head element to `first`.
 pub fn list_first_discard_rest(
   first: String,
 ) -> Pattern(List(a), Expression(a)) {
-  Constructor(
-    module: option.None,
-    constructor: #("[" <> first <> ", ..]", []),
+  List(
+    elements: [variable(first) |> to_dynamic()],
     output: expression.raw(first),
+    rest: option.Some(RestDiscard),
   )
 }
 
-/// Matches with `option.Some(inner)`. If the option module is already imported, this uses the existing 
+/// Match a list pattern.
+///
+/// ```gleam
+/// pattern.list(
+///   [pattern.string_literal("blog"), pattern.variable("slug")],
+/// )
+/// // -> Pattern matching ["blog", slug]
+/// ```
+pub fn list(
+  patterns: List(Pattern(input, output)),
+) -> Pattern(List(input), List(output)) {
+  let elements = list.map(patterns, to_dynamic)
+  let output = list.map(patterns, fn(pattern) { pattern.output })
+
+  List(elements:, output:, rest: option.None)
+}
+
+/// Match a list pattern including a discarded rest (`..`).
+///
+/// ```gleam
+/// pattern.list_with_discard_rest(
+///   [pattern.string_literal("files")],
+/// )
+/// // -> Pattern matching ["files", ..]
+/// ```
+pub fn list_with_discard_rest(
+  patterns: List(Pattern(input, output)),
+) -> Pattern(List(input), List(output)) {
+  let elements = list.map(patterns, to_dynamic)
+  let output = list.map(patterns, fn(pattern) { pattern.output })
+
+  let rest = RestDiscard
+
+  List(elements:, output:, rest: option.Some(rest))
+}
+
+/// Match a list pattern including a named rest variable.
+///
+/// ```gleam
+/// pattern.list_with_named_rest(
+///   [pattern.string_literal("files")],
+///   "rest",
+/// )
+/// // -> Pattern matching ["files", ..rest]
+/// ```
+pub fn list_with_named_rest(
+  patterns: List(Pattern(input, output)),
+  rest: String,
+) -> Pattern(List(input), List(output)) {
+  let elements = list.map(patterns, to_dynamic)
+  let output = list.map(patterns, fn(pattern) { pattern.output })
+  let rest_output = [to_output(expression.raw(rest))]
+
+  List(
+    elements:,
+    output: list.append(output, rest_output),
+    rest: option.Some(RestVariable(rest, output: rest_output)),
+  )
+}
+
+/// Matches with `option.Some(inner)`. If the option module is already imported, this uses the existing
 /// import options (ie qualified or unqualified and aliases). Otherwise, it adds the import.
 pub fn option_some(inner: Pattern(a, a_out)) -> Pattern(Option(a), a_out) {
   Constructor(
@@ -923,7 +1027,7 @@ pub fn option_some(inner: Pattern(a, a_out)) -> Pattern(Option(a), a_out) {
   )
 }
 
-/// Matches with `None`. If the option module is already imported, this uses the existing 
+/// Matches with `None`. If the option module is already imported, this uses the existing
 /// import options (ie qualified or unqualified and aliases). Otherwise, it adds the import.
 pub fn option_none() -> Pattern(Option(a), Nil) {
   Constructor(

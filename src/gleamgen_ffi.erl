@@ -8,4 +8,6 @@ get_function_name(Funct) ->
   erlang:atom_to_binary(Name).
 
 get_pattern_output({_, _, nil}) -> {error, nil};
-get_pattern_output({_, _, X}) -> {ok, X}.
+get_pattern_output({_, _, _, nil}) -> {error, nil};
+get_pattern_output({_, _, X}) -> {ok, X};
+get_pattern_output({_, _, _, X}) -> {ok, X}.
